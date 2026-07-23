@@ -296,21 +296,20 @@ impl VaapiHostEncoder {
             (*encoder.encoder_ctx).hw_frames_ctx = ff::av_buffer_ref(encoder.enc_frames_ctx);
             (*encoder.encoder_ctx).max_b_frames = 0;
             (*encoder.encoder_ctx).gop_size = if configuration.all_intra { 1 } else { i32::MAX };
-            (*encoder.encoder_ctx).slices = 4;
-            (*encoder.encoder_ctx).compression_level = 6;
+            (*encoder.encoder_ctx).flags |= ff::AV_CODEC_FLAG_LOW_DELAY as i32;
             (*encoder.encoder_ctx).bit_rate = i64::from(configuration.bitrate_bps);
-            (*encoder.encoder_ctx).rc_max_rate = i64::from(configuration.bitrate_bps);
-            let vbv = configuration
-                .bitrate_bps
-                .saturating_mul(2)
-                .min(i32::MAX as u32);
-            (*encoder.encoder_ctx).rc_buffer_size = vbv as i32;
 
             let mut options: *mut ff::AVDictionary = ptr::null_mut();
-            set_dictionary(&mut options, "rc_mode", "CBR")?;
+            // Preserve the validated all-IDR helper's driver-selected rate
+            // control for 5R-C parity. Pixelflux CBR/CQP policy returns with
+            // the production inter-frame work in 5R-D.
+            set_dictionary(&mut options, "aud", "0")?;
+            set_dictionary(&mut options, "bf", "0")?;
+            if configuration.all_intra {
+                set_dictionary(&mut options, "g", "1")?;
+                set_dictionary(&mut options, "idr_interval", "1")?;
+            }
             set_dictionary(&mut options, "async_depth", "1")?;
-            set_dictionary(&mut options, "profile", "high")?;
-            set_dictionary(&mut options, "level", "4.1")?;
             let status = ff::avcodec_open2(encoder.encoder_ctx, codec, &mut options);
             ff::av_dict_free(&mut options);
             check(
