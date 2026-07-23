@@ -1132,14 +1132,14 @@ mod tests {
             (w, h).into(),
         )];
         let dirty = super::encode_cpu(
-            &mut stripes, &pixels, w, h, &full, &settings, 0, false, false, None, false,
+            &mut stripes, &pixels, w, h, &full, &settings, 0, false, false, false,
         );
         assert!(!dirty.is_empty(), "damaged frame must encode");
 
         let mut fired_at = None;
         for frame in 1..=20u16 {
             let out = super::encode_cpu(
-                &mut stripes, &pixels, w, h, &[], &settings, frame, false, false, None, false,
+                &mut stripes, &pixels, w, h, &[], &settings, frame, false, false, false,
             );
             if !out.is_empty() {
                 assert!(fired_at.is_none(), "paint-over must fire exactly once");
@@ -1177,14 +1177,14 @@ mod tests {
         };
         let mut stripes = Vec::new();
         let first = super::encode_cpu(
-            &mut stripes, &static_px, w, h, &[], &settings, 0, false, true, None, false,
+            &mut stripes, &static_px, w, h, &[], &settings, 0, false, true, false,
         );
         assert!(!first.is_empty(), "first frame hashes as changed and encodes");
 
         let mut fired_at = None;
         for frame in 1..=20u16 {
             let out = super::encode_cpu(
-                &mut stripes, &static_px, w, h, &[], &settings, frame, false, true, None, false,
+                &mut stripes, &static_px, w, h, &[], &settings, frame, false, true, false,
             );
             if !out.is_empty() {
                 assert!(fired_at.is_none(), "paint-over must fire exactly once while static");
@@ -1194,7 +1194,7 @@ mod tests {
         assert_eq!(fired_at, Some(settings.paint_over_trigger_frames as u16));
 
         let woke = super::encode_cpu(
-            &mut stripes, &changed_px, w, h, &[], &settings, 21, false, true, None, false,
+            &mut stripes, &changed_px, w, h, &[], &settings, 21, false, true, false,
         );
         assert!(!woke.is_empty(), "content change after idle must encode");
     }
@@ -1313,7 +1313,7 @@ mod qp_bound_sweep {
                 let mut out = Vec::new();
                 enc.encode_with_headers(
                     &y, &u, &v, W as i32, (W / 2) as i32, (W / 2) as i32,
-                    i as i64, i == 0, &[], true, &mut out, None,
+                    i as i64, i == 0, &[], true, &mut out,
                 );
                 out
             })
@@ -1336,7 +1336,7 @@ mod qp_bound_sweep {
             video_max_qp: max_qp,
             ..Default::default()
         };
-        let mut enc = Openh264Encoder::new(&s, None).expect("oh264 init");
+        let mut enc = Openh264Encoder::new(&s).expect("oh264 init");
         (0..FRAMES)
             .map(|i| {
                 let y = text_luma(i);

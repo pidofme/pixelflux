@@ -8,6 +8,7 @@ name = "pixelflux"
 crate-type = ["cdylib"]
 
 [dependencies]
+pixelflux-core = { path = "../pixelflux-core" }
 pyo3 = { version = "0.29.0", features = ["extension-module"] }
 wayland-server = { version = "0.31.10", features = ["dlopen"] }
 wayland-protocols = { version = "0.32", features = ["server"] }
