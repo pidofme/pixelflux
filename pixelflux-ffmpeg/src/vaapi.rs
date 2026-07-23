@@ -303,13 +303,19 @@ impl VaapiHostEncoder {
             // Preserve the validated all-IDR helper's driver-selected rate
             // control for 5R-C parity. Pixelflux CBR/CQP policy returns with
             // the production inter-frame work in 5R-D.
-            set_dictionary(&mut options, "aud", "0")?;
-            set_dictionary(&mut options, "bf", "0")?;
-            if configuration.all_intra {
-                set_dictionary(&mut options, "g", "1")?;
-                set_dictionary(&mut options, "idr_interval", "1")?;
+            let option_result = (|| {
+                set_dictionary(&mut options, "aud", "0")?;
+                set_dictionary(&mut options, "bf", "0")?;
+                if configuration.all_intra {
+                    set_dictionary(&mut options, "g", "1")?;
+                    set_dictionary(&mut options, "idr_interval", "1")?;
+                }
+                set_dictionary(&mut options, "async_depth", "1")
+            })();
+            if let Err(error) = option_result {
+                ff::av_dict_free(&mut options);
+                return Err(error);
             }
-            set_dictionary(&mut options, "async_depth", "1")?;
             let status = ff::avcodec_open2(encoder.encoder_ctx, codec, &mut options);
             ff::av_dict_free(&mut options);
             check(
