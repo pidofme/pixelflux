@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: MPL-2.0
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+[package]
+name = "pixelflux-ffmpeg"
+version = "2.0.0-waydesk.1"
+edition = "2021"
+license = "MPL-2.0"
+description = "Python-free FFmpeg media primitives extracted from Pixelflux"
+publish = false
+
+[dependencies]
+ffmpeg-sys-next = { version = "8.1", default-features = false, features = ["avcodec", "avfilter"] }
+libc = "0.2"
+thiserror = "2"
+
+[lints.rust]
+unsafe_code = "allow"
