@@ -3,12 +3,11 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Host-frame VA-API encoding extracted from Pixelflux 2.0.0.
+//! Host-frame and DRM-PRIME VA-API encoding extracted from Pixelflux 2.0.0.
 //!
-//! This is the CPU capture entry point from Pixelflux's VA-API backend with
-//! Python, Wayland, DRM-PRIME input, stripe framing, and recording removed.
-//! Color conversion remains on the VA device through
-//! `hwupload,scale_vaapi=format=nv12`.
+//! Python, Wayland, stripe framing, and recording are removed. CPU capture uses
+//! `hwupload,scale_vaapi=format=nv12`; same-device DMABUF input uses an owned
+//! `AVDRMFrameDescriptor` with `hwmap,scale_vaapi=format=nv12`.
 
 use std::ffi::{c_int, c_void, CStr, CString};
 use std::fmt;
