@@ -39,6 +39,44 @@ impl HostPixelFormat {
     }
 }
 
+/// H.264 reference policy for the low-latency VA-API encoder.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum H264Gop {
+    /// Every access unit is an independently decodable IDR diagnostic frame.
+    AllIntra,
+    /// Emit P-frames between requested or periodic IDRs, with no B-frames.
+    LowLatency { keyframe_interval_frames: u32 },
+}
+
+impl H264Gop {
+    fn validate(self) -> Result<(), VaapiError> {
+        match self {
+            Self::AllIntra => Ok(()),
+            Self::LowLatency {
+                keyframe_interval_frames,
+            } if keyframe_interval_frames > 0 => Ok(()),
+            Self::LowLatency { .. } => Err(VaapiError::new(
+                VaapiErrorKind::InvalidConfiguration,
+                "validate GOP configuration",
+                "keyframe interval must contain at least one frame",
+            )),
+        }
+    }
+
+    const fn forces_every_frame(self) -> bool {
+        matches!(self, Self::AllIntra)
+    }
+
+    const fn keyframe_interval_frames(self) -> u32 {
+        match self {
+            Self::AllIntra => 1,
+            Self::LowLatency {
+                keyframe_interval_frames,
+            } => keyframe_interval_frames,
+        }
+    }
+}
+
 /// Immutable configuration for one VA-API encoder context.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VaapiHostConfiguration {
@@ -48,13 +86,12 @@ pub struct VaapiHostConfiguration {
     pub refresh_hz: u32,
     pub bitrate_bps: u32,
     pub pixel_format: HostPixelFormat,
-    /// Retains the all-IDR compatibility mode used by the embedding product
-    /// while its inter-frame recovery contract is migrated separately.
-    pub all_intra: bool,
+    pub gop: H264Gop,
 }
 
 impl VaapiHostConfiguration {
     fn validate(&self) -> Result<(i32, i32, i32), VaapiError> {
+        self.gop.validate()?;
         if self.device.as_os_str().is_empty()
             || self.width == 0
             || self.height == 0
@@ -189,7 +226,8 @@ pub struct VaapiHostEncoder {
     height: i32,
     refresh_hz: i32,
     pixel_format: HostPixelFormat,
-    all_intra: bool,
+    gop: H264Gop,
+    frames_since_keyframe: u32,
 }
 
 // FFmpeg contexts are used only by the owning encoder thread.
@@ -212,7 +250,7 @@ impl VaapiHostEncoder {
             height,
             refresh_hz,
             configuration.pixel_format,
-            configuration.all_intra,
+            configuration.gop,
         );
 
         unsafe {
@@ -295,7 +333,13 @@ impl VaapiHostEncoder {
             (*encoder.encoder_ctx).hw_device_ctx = ff::av_buffer_ref(encoder.hw_device_ctx);
             (*encoder.encoder_ctx).hw_frames_ctx = ff::av_buffer_ref(encoder.enc_frames_ctx);
             (*encoder.encoder_ctx).max_b_frames = 0;
-            (*encoder.encoder_ctx).gop_size = if configuration.all_intra { 1 } else { i32::MAX };
+            (*encoder.encoder_ctx).gop_size = if configuration.gop.forces_every_frame() {
+                1
+            } else {
+                i32::MAX
+            };
+            (*encoder.encoder_ctx).slices = 4;
+            (*encoder.encoder_ctx).compression_level = 6;
             (*encoder.encoder_ctx).flags |= ff::AV_CODEC_FLAG_LOW_DELAY as i32;
             (*encoder.encoder_ctx).bit_rate = i64::from(configuration.bitrate_bps);
 
@@ -306,7 +350,9 @@ impl VaapiHostEncoder {
             let option_result = (|| {
                 set_dictionary(&mut options, "aud", "0")?;
                 set_dictionary(&mut options, "bf", "0")?;
-                if configuration.all_intra {
+                set_dictionary(&mut options, "profile", "high")?;
+                set_dictionary(&mut options, "level", "4.1")?;
+                if configuration.gop.forces_every_frame() {
                     set_dictionary(&mut options, "g", "1")?;
                     set_dictionary(&mut options, "idr_interval", "1")?;
                 }
@@ -620,8 +666,12 @@ impl VaapiHostEncoder {
                 VaapiErrorKind::EncodeFailed,
                 "receive converted VA-API frame",
             )?;
-            if force_keyframe || self.all_intra {
+            let keyframe_due = self.gop.forces_every_frame()
+                || self.frames_since_keyframe >= self.gop.keyframe_interval_frames();
+            if force_keyframe || keyframe_due {
                 (*self.filtered_frame).pict_type = ff::AVPictureType::AV_PICTURE_TYPE_I;
+            } else {
+                (*self.filtered_frame).pict_type = ff::AVPictureType::AV_PICTURE_TYPE_NONE;
             }
             (*self.filtered_frame).pts = pts;
             let send_status = ff::avcodec_send_frame(self.encoder_ctx, self.filtered_frame);
@@ -674,6 +724,11 @@ impl VaapiHostEncoder {
                 keyframe: ((*self.packet).flags & ff::AV_PKT_FLAG_KEY) != 0,
                 pts: (*self.packet).pts,
             };
+            if packet.keyframe {
+                self.frames_since_keyframe = 0;
+            } else {
+                self.frames_since_keyframe = self.frames_since_keyframe.saturating_add(1);
+            }
             ff::av_packet_unref(self.packet);
 
             let extra_status = ff::avcodec_receive_packet(self.encoder_ctx, self.packet);
@@ -701,7 +756,7 @@ impl VaapiHostEncoder {
         height: i32,
         refresh_hz: i32,
         pixel_format: HostPixelFormat,
-        all_intra: bool,
+        gop: H264Gop,
     ) -> Self {
         Self {
             encoder_ctx: ptr::null_mut(),
@@ -718,7 +773,8 @@ impl VaapiHostEncoder {
             height,
             refresh_hz,
             pixel_format,
-            all_intra,
+            gop,
+            frames_since_keyframe: gop.keyframe_interval_frames(),
         }
     }
 }
@@ -820,7 +876,7 @@ mod tests {
             refresh_hz: 30,
             bitrate_bps: 1_000_000,
             pixel_format: HostPixelFormat::Rgba,
-            all_intra: true,
+            gop: H264Gop::AllIntra,
         }
     }
 
@@ -839,5 +895,25 @@ mod tests {
     fn surface_alignment_matches_vaapi_pool_contract() {
         assert_eq!(align(320, 16), Ok(320));
         assert_eq!(align(241, 32), Ok(256));
+    }
+
+    #[test]
+    fn production_gop_requires_a_bounded_nonzero_interval() {
+        let mut invalid = configuration();
+        invalid.gop = H264Gop::LowLatency {
+            keyframe_interval_frames: 0,
+        };
+        assert_eq!(
+            invalid
+                .validate()
+                .expect_err("zero GOP interval must fail")
+                .kind(),
+            VaapiErrorKind::InvalidConfiguration,
+        );
+        let mut production = configuration();
+        production.gop = H264Gop::LowLatency {
+            keyframe_interval_frames: 60,
+        };
+        assert_eq!(production.validate(), Ok((320, 240, 30)));
     }
 }
