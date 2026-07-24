@@ -14,6 +14,6 @@ mod vaapi;
 
 pub use decoder::{decode_h264_luma, DecodedFrame, DecoderError, H264StreamDecoder};
 pub use vaapi::{
-    EncodedPacket, H264Gop, HostPixelFormat, VaapiError, VaapiErrorKind, VaapiHostConfiguration,
-    VaapiHostEncoder,
+    DrmPrimeFrame, DrmPrimePlane, EncodedPacket, H264Gop, HostPixelFormat, VaapiError,
+    VaapiErrorKind, VaapiHostConfiguration, VaapiHostEncoder,
 };

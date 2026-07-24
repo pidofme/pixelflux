@@ -10,8 +10,10 @@
 //! Color conversion remains on the VA device through
 //! `hwupload,scale_vaapi=format=nv12`.
 
-use std::ffi::{c_void, CStr, CString};
+use std::ffi::{c_int, c_void, CStr, CString};
 use std::fmt;
+use std::mem;
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::PathBuf;
 use std::ptr;
@@ -22,6 +24,93 @@ use ffmpeg_sys_next as ff;
 const ENCODER_SURFACE_POOL_SIZE: i32 = 20;
 const MAX_REFRESH_HZ: u32 = 1_000;
 const MAX_RAW_FRAME_BYTES: usize = 512 * 1024 * 1024;
+const AV_DRM_MAX_PLANES: usize = 4;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct AVDRMObjectDescriptor {
+    fd: c_int,
+    size: usize,
+    format_modifier: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct AVDRMPlaneDescriptor {
+    object_index: c_int,
+    offset: isize,
+    pitch: isize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct AVDRMLayerDescriptor {
+    format: u32,
+    nb_planes: c_int,
+    planes: [AVDRMPlaneDescriptor; AV_DRM_MAX_PLANES],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct AVDRMFrameDescriptor {
+    nb_objects: c_int,
+    objects: [AVDRMObjectDescriptor; AV_DRM_MAX_PLANES],
+    nb_layers: c_int,
+    layers: [AVDRMLayerDescriptor; AV_DRM_MAX_PLANES],
+}
+
+struct DmabufResources {
+    fds: Vec<c_int>,
+}
+
+unsafe extern "C" fn release_drm_frame(opaque: *mut c_void, data: *mut u8) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let resources = Box::from_raw(opaque.cast::<DmabufResources>());
+        for fd in resources.fds {
+            libc::close(fd);
+        }
+        if !data.is_null() {
+            ff::av_free(data.cast::<c_void>());
+        }
+    }));
+}
+
+/// One borrowed plane in an owned DRM-PRIME frame description.
+#[derive(Clone, Copy, Debug)]
+pub struct DrmPrimePlane<'a> {
+    pub fd: BorrowedFd<'a>,
+    pub offset: u32,
+    pub stride: u32,
+}
+
+/// Borrowed DRM-PRIME metadata whose file descriptors are duplicated into FFmpeg ownership.
+#[derive(Clone, Copy, Debug)]
+pub struct DrmPrimeFrame<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub fourcc: u32,
+    pub modifier: u64,
+    pub planes: &'a [DrmPrimePlane<'a>],
+}
+
+impl DrmPrimeFrame<'_> {
+    fn validate(self, width: i32, height: i32) -> Result<(), VaapiError> {
+        if self.width != u32::try_from(width).unwrap_or_default()
+            || self.height != u32::try_from(height).unwrap_or_default()
+            || self.fourcc == 0
+            || self.planes.is_empty()
+            || self.planes.len() > AV_DRM_MAX_PLANES
+            || self.planes.iter().any(|plane| plane.stride == 0)
+        {
+            return Err(VaapiError::new(
+                VaapiErrorKind::InvalidConfiguration,
+                "validate DRM-PRIME frame",
+                "dimensions, format, plane count, or stride are invalid",
+            ));
+        }
+        Ok(())
+    }
+}
 
 /// CPU pixel layouts accepted by the host-frame uploader.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -210,11 +299,18 @@ impl fmt::Display for VaapiError {
 
 impl std::error::Error for VaapiError {}
 
-/// In-process FFmpeg `h264_vaapi` encoder for owned CPU frames.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InputMode {
+    Host,
+    DrmPrime,
+}
+
+/// In-process FFmpeg `h264_vaapi` encoder for owned CPU or DRM-PRIME frames.
 pub struct VaapiHostEncoder {
     encoder_ctx: *mut ff::AVCodecContext,
     hw_device_ctx: *mut ff::AVBufferRef,
     drm_device_ctx: *mut ff::AVBufferRef,
+    drm_frames_ctx: *mut ff::AVBufferRef,
     enc_frames_ctx: *mut ff::AVBufferRef,
     filter_graph: *mut ff::AVFilterGraph,
     buffersrc_ctx: *mut ff::AVFilterContext,
@@ -226,6 +322,7 @@ pub struct VaapiHostEncoder {
     height: i32,
     refresh_hz: i32,
     pixel_format: HostPixelFormat,
+    input_mode: InputMode,
     gop: H264Gop,
     frames_since_keyframe: u32,
 }
@@ -237,6 +334,18 @@ impl VaapiHostEncoder {
     /// Opens the render node, derives a VA device, creates the NV12 surface
     /// pool, and preflights the host upload/filter/encoder path.
     pub fn open(configuration: &VaapiHostConfiguration) -> Result<Self, VaapiError> {
+        Self::open_impl(configuration, InputMode::Host)
+    }
+
+    /// Opens the same VA-API encoder with a DRM-PRIME `hwmap` input graph.
+    pub fn open_dmabuf(configuration: &VaapiHostConfiguration) -> Result<Self, VaapiError> {
+        Self::open_impl(configuration, InputMode::DrmPrime)
+    }
+
+    fn open_impl(
+        configuration: &VaapiHostConfiguration,
+        input_mode: InputMode,
+    ) -> Result<Self, VaapiError> {
         let (width, height, refresh_hz) = configuration.validate()?;
         let device = CString::new(configuration.device.as_os_str().as_bytes()).map_err(|_| {
             VaapiError::new(
@@ -250,6 +359,7 @@ impl VaapiHostEncoder {
             height,
             refresh_hz,
             configuration.pixel_format,
+            input_mode,
             configuration.gop,
         );
 
@@ -274,6 +384,35 @@ impl VaapiHostEncoder {
                 0,
             );
             check(status, VaapiErrorKind::Unavailable, "derive VA-API device")?;
+
+            if input_mode == InputMode::DrmPrime {
+                encoder.drm_frames_ctx = ff::av_hwframe_ctx_alloc(encoder.drm_device_ctx);
+                if encoder.drm_frames_ctx.is_null() {
+                    return Err(VaapiError::new(
+                        VaapiErrorKind::Unavailable,
+                        "allocate DRM-PRIME frames context",
+                        "FFmpeg returned a null frames context",
+                    ));
+                }
+                let frames = (*encoder.drm_frames_ctx).data as *mut ff::AVHWFramesContext;
+                if frames.is_null() {
+                    return Err(VaapiError::new(
+                        VaapiErrorKind::Unavailable,
+                        "allocate DRM-PRIME frames context",
+                        "FFmpeg returned an empty frames context",
+                    ));
+                }
+                (*frames).format = ff::AVPixelFormat::AV_PIX_FMT_DRM_PRIME;
+                (*frames).sw_format = ff::AVPixelFormat::AV_PIX_FMT_BGRA;
+                (*frames).width = width;
+                (*frames).height = height;
+                (*frames).initial_pool_size = 0;
+                check(
+                    ff::av_hwframe_ctx_init(encoder.drm_frames_ctx),
+                    VaapiErrorKind::Unavailable,
+                    "initialize DRM-PRIME frames context",
+                )?;
+            }
 
             encoder.enc_frames_ctx = ff::av_hwframe_ctx_alloc(encoder.hw_device_ctx);
             if encoder.enc_frames_ctx.is_null() {
@@ -449,7 +588,13 @@ impl VaapiHostEncoder {
                 "FFmpeg returned a null parameter block",
             ));
         }
-        (*parameters).format = self.pixel_format.ffmpeg() as i32;
+        (*parameters).format = match self.input_mode {
+            InputMode::Host => self.pixel_format.ffmpeg() as i32,
+            InputMode::DrmPrime => ff::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32,
+        };
+        if self.input_mode == InputMode::DrmPrime {
+            (*parameters).hw_frames_ctx = ff::av_buffer_ref(self.drm_frames_ctx);
+        }
         (*parameters).width = self.width;
         (*parameters).height = self.height;
         (*parameters).time_base = ff::AVRational {
@@ -457,6 +602,9 @@ impl VaapiHostEncoder {
             den: self.refresh_hz,
         };
         let status = ff::av_buffersrc_parameters_set(self.buffersrc_ctx, parameters);
+        if !(*parameters).hw_frames_ctx.is_null() {
+            ff::av_buffer_unref(&mut (*parameters).hw_frames_ctx);
+        }
         ff::av_free(parameters.cast::<c_void>());
         check(
             status,
@@ -489,8 +637,12 @@ impl VaapiHostEncoder {
             "initialize VA-API buffer sink",
         )?;
 
+        let staging = match self.input_mode {
+            InputMode::Host => "hwupload",
+            InputMode::DrmPrime => "hwmap",
+        };
         let description = CString::new(format!(
-            "hwupload,scale_vaapi=w={}:h={}:format=nv12:out_color_matrix=bt709:out_range=tv",
+            "{staging},scale_vaapi=w={}:h={}:format=nv12:out_color_matrix=bt709:out_range=tv",
             self.width, self.height
         ))
         .expect("numeric filter description");
@@ -540,7 +692,7 @@ impl VaapiHostEncoder {
                     (*inputs).pad_idx as u32,
                 ),
                 VaapiErrorKind::Unavailable,
-                "link host-frame upload filter",
+                "link VA-API input staging filter",
             )?;
             check(
                 ff::avfilter_link(
@@ -574,6 +726,13 @@ impl VaapiHostEncoder {
         pts: i64,
         force_keyframe: bool,
     ) -> Result<EncodedPacket, VaapiError> {
+        if self.input_mode != InputMode::Host {
+            return Err(VaapiError::new(
+                VaapiErrorKind::InvalidConfiguration,
+                "validate host frame",
+                "encoder was opened for DRM-PRIME input",
+            ));
+        }
         let minimum_stride = usize::try_from(self.width)
             .ok()
             .and_then(|width| width.checked_mul(4))
@@ -660,95 +819,249 @@ impl VaapiHostEncoder {
                 VaapiErrorKind::EncodeFailed,
                 "upload host frame",
             )?;
-            ff::av_frame_unref(self.filtered_frame);
-            check(
-                ff::av_buffersink_get_frame(self.buffersink_ctx, self.filtered_frame),
-                VaapiErrorKind::EncodeFailed,
-                "receive converted VA-API frame",
-            )?;
-            let keyframe_due = self.gop.forces_every_frame()
-                || self.frames_since_keyframe >= self.gop.keyframe_interval_frames();
-            if force_keyframe || keyframe_due {
-                (*self.filtered_frame).pict_type = ff::AVPictureType::AV_PICTURE_TYPE_I;
-            } else {
-                (*self.filtered_frame).pict_type = ff::AVPictureType::AV_PICTURE_TYPE_NONE;
-            }
-            (*self.filtered_frame).pts = pts;
-            let send_status = ff::avcodec_send_frame(self.encoder_ctx, self.filtered_frame);
-            ff::av_frame_unref(self.filtered_frame);
-            check(
-                send_status,
-                VaapiErrorKind::EncodeFailed,
-                "submit VA-API frame",
-            )?;
+            self.receive_and_encode(pts, force_keyframe)
+        }
+    }
 
-            ff::av_packet_unref(self.packet);
-            let receive_status = ff::avcodec_receive_packet(self.encoder_ctx, self.packet);
-            if receive_status == ff::AVERROR(libc::EAGAIN) {
+    /// Wraps one DRM-PRIME frame in an FFmpeg descriptor, maps it to VA-API,
+    /// converts it to NV12 on-device, and emits exactly one packet.
+    pub fn encode_dmabuf(
+        &mut self,
+        frame: DrmPrimeFrame<'_>,
+        pts: i64,
+        force_keyframe: bool,
+    ) -> Result<EncodedPacket, VaapiError> {
+        if self.input_mode != InputMode::DrmPrime {
+            return Err(VaapiError::new(
+                VaapiErrorKind::InvalidConfiguration,
+                "validate DRM-PRIME frame",
+                "encoder was opened for host input",
+            ));
+        }
+        frame.validate(self.width, self.height)?;
+
+        unsafe {
+            let descriptor_size = mem::size_of::<AVDRMFrameDescriptor>();
+            let descriptor = ff::av_mallocz(descriptor_size).cast::<AVDRMFrameDescriptor>();
+            if descriptor.is_null() {
                 return Err(VaapiError::new(
                     VaapiErrorKind::EncodeFailed,
-                    "receive VA-API packet",
-                    "low-latency encoder produced no packet for the submitted frame",
+                    "allocate DRM-PRIME descriptor",
+                    "FFmpeg returned a null allocation",
                 ));
             }
-            check(
-                receive_status,
-                VaapiErrorKind::EncodeFailed,
-                "receive VA-API packet",
-            )?;
-            if (*self.packet).pts != pts {
-                ff::av_packet_unref(self.packet);
-                return Err(VaapiError::new(
-                    VaapiErrorKind::InvalidOutput,
-                    "validate VA-API packet",
-                    "packet PTS does not match the submitted frame",
-                ));
-            }
-            let size = usize::try_from((*self.packet).size).map_err(|_| {
+
+            let mut resources = DmabufResources {
+                fds: Vec::with_capacity(frame.planes.len()),
+            };
+            (*descriptor).nb_objects = c_int::try_from(frame.planes.len()).map_err(|_| {
                 VaapiError::new(
-                    VaapiErrorKind::InvalidOutput,
-                    "validate VA-API packet",
-                    "packet size is negative",
+                    VaapiErrorKind::InvalidConfiguration,
+                    "validate DRM-PRIME frame",
+                    "plane count does not fit FFmpeg",
                 )
             })?;
-            if size == 0 || (*self.packet).data.is_null() {
-                ff::av_packet_unref(self.packet);
-                return Err(VaapiError::new(
-                    VaapiErrorKind::InvalidOutput,
-                    "validate VA-API packet",
-                    "encoder returned an empty packet",
-                ));
-            }
-            let packet = EncodedPacket {
-                annex_b: slice::from_raw_parts((*self.packet).data, size).to_vec(),
-                keyframe: ((*self.packet).flags & ff::AV_PKT_FLAG_KEY) != 0,
-                pts: (*self.packet).pts,
-            };
-            if packet.keyframe {
-                self.frames_since_keyframe = 0;
-            } else {
-                self.frames_since_keyframe = self.frames_since_keyframe.saturating_add(1);
-            }
-            ff::av_packet_unref(self.packet);
+            (*descriptor).nb_layers = 1;
+            (*descriptor).layers[0].format = frame.fourcc;
+            (*descriptor).layers[0].nb_planes = (*descriptor).nb_objects;
 
-            let extra_status = ff::avcodec_receive_packet(self.encoder_ctx, self.packet);
-            if extra_status == 0 {
-                ff::av_packet_unref(self.packet);
+            let aligned_height = usize::try_from(align(self.height, 32)?).map_err(|_| {
+                VaapiError::new(
+                    VaapiErrorKind::InvalidConfiguration,
+                    "validate DRM-PRIME frame",
+                    "aligned height does not fit memory",
+                )
+            })?;
+            for (index, plane) in frame.planes.iter().enumerate() {
+                let fd = libc::dup(plane.fd.as_raw_fd());
+                if fd < 0 {
+                    for duplicated in resources.fds.drain(..) {
+                        libc::close(duplicated);
+                    }
+                    ff::av_free(descriptor.cast::<c_void>());
+                    return Err(VaapiError::new(
+                        VaapiErrorKind::EncodeFailed,
+                        "duplicate DRM-PRIME file descriptor",
+                        std::io::Error::last_os_error().to_string(),
+                    ));
+                }
+                resources.fds.push(fd);
+                let object_size = usize::try_from(plane.offset)
+                    .ok()
+                    .and_then(|offset| {
+                        usize::try_from(plane.stride)
+                            .ok()
+                            .and_then(|stride| stride.checked_mul(aligned_height))
+                            .and_then(|bytes| offset.checked_add(bytes))
+                    })
+                    .ok_or_else(|| {
+                        VaapiError::new(
+                            VaapiErrorKind::InvalidConfiguration,
+                            "validate DRM-PRIME frame",
+                            "plane object size overflowed",
+                        )
+                    })?;
+                (*descriptor).objects[index].fd = fd;
+                (*descriptor).objects[index].size = object_size;
+                (*descriptor).objects[index].format_modifier = frame.modifier;
+                (*descriptor).layers[0].planes[index].object_index = c_int::try_from(index)
+                    .map_err(|_| {
+                        VaapiError::new(
+                            VaapiErrorKind::InvalidConfiguration,
+                            "validate DRM-PRIME frame",
+                            "plane index does not fit FFmpeg",
+                        )
+                    })?;
+                (*descriptor).layers[0].planes[index].offset = isize::try_from(plane.offset)
+                    .map_err(|_| {
+                        VaapiError::new(
+                            VaapiErrorKind::InvalidConfiguration,
+                            "validate DRM-PRIME frame",
+                            "plane offset does not fit FFmpeg",
+                        )
+                    })?;
+                (*descriptor).layers[0].planes[index].pitch = isize::try_from(plane.stride)
+                    .map_err(|_| {
+                        VaapiError::new(
+                            VaapiErrorKind::InvalidConfiguration,
+                            "validate DRM-PRIME frame",
+                            "plane stride does not fit FFmpeg",
+                        )
+                    })?;
+            }
+
+            ff::av_frame_unref(self.video_frame);
+            (*self.video_frame).width = self.width;
+            (*self.video_frame).height = self.height;
+            (*self.video_frame).format = ff::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32;
+            (*self.video_frame).data[0] = descriptor.cast::<u8>();
+            let opaque = Box::into_raw(Box::new(resources));
+            let buffer = ff::av_buffer_create(
+                descriptor.cast::<u8>(),
+                descriptor_size,
+                Some(release_drm_frame),
+                opaque.cast::<c_void>(),
+                0,
+            );
+            if buffer.is_null() {
+                release_drm_frame(opaque.cast::<c_void>(), ptr::null_mut());
+                ff::av_free(descriptor.cast::<c_void>());
                 return Err(VaapiError::new(
-                    VaapiErrorKind::InvalidOutput,
-                    "validate VA-API packet count",
-                    "one submitted frame produced more than one packet",
+                    VaapiErrorKind::EncodeFailed,
+                    "wrap DRM-PRIME descriptor",
+                    "FFmpeg returned a null buffer reference",
                 ));
             }
-            if extra_status != ff::AVERROR(libc::EAGAIN) && extra_status != ff::AVERROR_EOF {
+            (*self.video_frame).buf[0] = buffer;
+            (*self.video_frame).pts = pts;
+            (*self.video_frame).hw_frames_ctx = ff::av_buffer_ref(self.drm_frames_ctx);
+
+            let status = ff::av_buffersrc_add_frame(self.buffersrc_ctx, self.video_frame);
+            if status < 0 {
+                ff::av_frame_unref(self.video_frame);
                 return Err(VaapiError::ffmpeg(
                     VaapiErrorKind::EncodeFailed,
-                    "drain VA-API encoder",
-                    extra_status,
+                    "map DRM-PRIME frame",
+                    status,
                 ));
             }
-            Ok(packet)
+            self.receive_and_encode(pts, force_keyframe)
         }
+    }
+
+    unsafe fn receive_and_encode(
+        &mut self,
+        pts: i64,
+        force_keyframe: bool,
+    ) -> Result<EncodedPacket, VaapiError> {
+        ff::av_frame_unref(self.filtered_frame);
+        check(
+            ff::av_buffersink_get_frame(self.buffersink_ctx, self.filtered_frame),
+            VaapiErrorKind::EncodeFailed,
+            "receive converted VA-API frame",
+        )?;
+        let keyframe_due = self.gop.forces_every_frame()
+            || self.frames_since_keyframe >= self.gop.keyframe_interval_frames();
+        if force_keyframe || keyframe_due {
+            (*self.filtered_frame).pict_type = ff::AVPictureType::AV_PICTURE_TYPE_I;
+        } else {
+            (*self.filtered_frame).pict_type = ff::AVPictureType::AV_PICTURE_TYPE_NONE;
+        }
+        (*self.filtered_frame).pts = pts;
+        let send_status = ff::avcodec_send_frame(self.encoder_ctx, self.filtered_frame);
+        ff::av_frame_unref(self.filtered_frame);
+        check(
+            send_status,
+            VaapiErrorKind::EncodeFailed,
+            "submit VA-API frame",
+        )?;
+
+        ff::av_packet_unref(self.packet);
+        let receive_status = ff::avcodec_receive_packet(self.encoder_ctx, self.packet);
+        if receive_status == ff::AVERROR(libc::EAGAIN) {
+            return Err(VaapiError::new(
+                VaapiErrorKind::EncodeFailed,
+                "receive VA-API packet",
+                "low-latency encoder produced no packet for the submitted frame",
+            ));
+        }
+        check(
+            receive_status,
+            VaapiErrorKind::EncodeFailed,
+            "receive VA-API packet",
+        )?;
+        if (*self.packet).pts != pts {
+            ff::av_packet_unref(self.packet);
+            return Err(VaapiError::new(
+                VaapiErrorKind::InvalidOutput,
+                "validate VA-API packet",
+                "packet PTS does not match the submitted frame",
+            ));
+        }
+        let size = usize::try_from((*self.packet).size).map_err(|_| {
+            VaapiError::new(
+                VaapiErrorKind::InvalidOutput,
+                "validate VA-API packet",
+                "packet size is negative",
+            )
+        })?;
+        if size == 0 || (*self.packet).data.is_null() {
+            ff::av_packet_unref(self.packet);
+            return Err(VaapiError::new(
+                VaapiErrorKind::InvalidOutput,
+                "validate VA-API packet",
+                "encoder returned an empty packet",
+            ));
+        }
+        let packet = EncodedPacket {
+            annex_b: slice::from_raw_parts((*self.packet).data, size).to_vec(),
+            keyframe: ((*self.packet).flags & ff::AV_PKT_FLAG_KEY) != 0,
+            pts: (*self.packet).pts,
+        };
+        if packet.keyframe {
+            self.frames_since_keyframe = 0;
+        } else {
+            self.frames_since_keyframe = self.frames_since_keyframe.saturating_add(1);
+        }
+        ff::av_packet_unref(self.packet);
+
+        let extra_status = ff::avcodec_receive_packet(self.encoder_ctx, self.packet);
+        if extra_status == 0 {
+            ff::av_packet_unref(self.packet);
+            return Err(VaapiError::new(
+                VaapiErrorKind::InvalidOutput,
+                "validate VA-API packet count",
+                "one submitted frame produced more than one packet",
+            ));
+        }
+        if extra_status != ff::AVERROR(libc::EAGAIN) && extra_status != ff::AVERROR_EOF {
+            return Err(VaapiError::ffmpeg(
+                VaapiErrorKind::EncodeFailed,
+                "drain VA-API encoder",
+                extra_status,
+            ));
+        }
+        Ok(packet)
     }
 
     fn empty(
@@ -756,12 +1069,14 @@ impl VaapiHostEncoder {
         height: i32,
         refresh_hz: i32,
         pixel_format: HostPixelFormat,
+        input_mode: InputMode,
         gop: H264Gop,
     ) -> Self {
         Self {
             encoder_ctx: ptr::null_mut(),
             hw_device_ctx: ptr::null_mut(),
             drm_device_ctx: ptr::null_mut(),
+            drm_frames_ctx: ptr::null_mut(),
             enc_frames_ctx: ptr::null_mut(),
             filter_graph: ptr::null_mut(),
             buffersrc_ctx: ptr::null_mut(),
@@ -773,6 +1088,7 @@ impl VaapiHostEncoder {
             height,
             refresh_hz,
             pixel_format,
+            input_mode,
             gop,
             frames_since_keyframe: gop.keyframe_interval_frames(),
         }
@@ -799,6 +1115,9 @@ impl Drop for VaapiHostEncoder {
             }
             if !self.enc_frames_ctx.is_null() {
                 ff::av_buffer_unref(&mut self.enc_frames_ctx);
+            }
+            if !self.drm_frames_ctx.is_null() {
+                ff::av_buffer_unref(&mut self.drm_frames_ctx);
             }
             if !self.hw_device_ctx.is_null() {
                 ff::av_buffer_unref(&mut self.hw_device_ctx);
@@ -866,6 +1185,9 @@ fn ffmpeg_error_string(status: i32) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
+    use std::os::fd::AsFd as _;
+
     use super::*;
 
     fn configuration() -> VaapiHostConfiguration {
@@ -895,6 +1217,34 @@ mod tests {
     fn surface_alignment_matches_vaapi_pool_contract() {
         assert_eq!(align(320, 16), Ok(320));
         assert_eq!(align(241, 32), Ok(256));
+    }
+
+    #[test]
+    fn drm_prime_metadata_is_bounded_without_opening_ffmpeg() {
+        let file = File::open("/dev/null").expect("test file descriptor");
+        let planes = [DrmPrimePlane {
+            fd: file.as_fd(),
+            offset: 0,
+            stride: 1_280,
+        }];
+        assert!(DrmPrimeFrame {
+            width: 320,
+            height: 240,
+            fourcc: u32::from_le_bytes(*b"AR24"),
+            modifier: 0,
+            planes: &planes,
+        }
+        .validate(320, 240)
+        .is_ok());
+        assert!(DrmPrimeFrame {
+            width: 320,
+            height: 240,
+            fourcc: u32::from_le_bytes(*b"AR24"),
+            modifier: 0,
+            planes: &[],
+        }
+        .validate(320, 240)
+        .is_err());
     }
 
     #[test]

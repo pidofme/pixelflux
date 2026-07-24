@@ -24,6 +24,8 @@ use smithay::reexports::wayland_server::DisplayHandle;
 use thiserror::Error;
 
 const MAX_DIMENSION: u32 = 8_192;
+const TARGET_POOL_SIZE: usize = 2;
+const _: () = assert!(TARGET_POOL_SIZE >= 2);
 
 /// Classified GLES/GBM initialization and allocation failure.
 #[derive(Debug, Error)]
@@ -36,14 +38,21 @@ pub enum RendererError {
     Initialize(&'static str),
     #[error("failed to allocate the GLES/GBM render target")]
     Allocate,
+    #[error("all GLES/GBM render targets are leased")]
+    Busy,
 }
 
-/// One GLES renderer and one ARGB8888 GBM target exported as a DMABUF.
+struct RenderTarget {
+    _buffer_object: BufferObject<()>,
+    dmabuf: Dmabuf,
+    leased: bool,
+}
+
+/// One GLES renderer and a bounded pool of ARGB8888 GBM targets exported as DMABUFs.
 pub struct GlesGbmTarget {
     renderer: GlesRenderer,
     allocator: RawGbmDevice<File>,
-    target_bo: BufferObject<()>,
-    target_dmabuf: Dmabuf,
+    targets: Vec<RenderTarget>,
     render_node: DrmNode,
     width: u32,
     height: u32,
@@ -70,13 +79,12 @@ impl GlesGbmTarget {
             .map_err(|_| RendererError::Initialize("GLES renderer"))?;
         let render_node =
             DrmNode::from_path(path).map_err(|_| RendererError::Initialize("DRM node"))?;
-        let (target_bo, target_dmabuf) = allocate_target(&allocator, &render_node, width, height)?;
+        let targets = allocate_targets(&allocator, &render_node, width, height)?;
 
         Ok(Self {
             renderer,
             allocator,
-            target_bo,
-            target_dmabuf,
+            targets,
             render_node,
             width,
             height,
@@ -90,15 +98,48 @@ impl GlesGbmTarget {
             .map_err(|_| RendererError::Initialize("Wayland EGL binding"))
     }
 
-    /// Returns disjoint mutable renderer and framebuffer handles for one render pass.
-    pub fn render_parts(&mut self) -> (&mut GlesRenderer, &mut Dmabuf) {
-        (&mut self.renderer, &mut self.target_dmabuf)
+    /// Leases one free target without blocking the compositor thread.
+    #[must_use]
+    pub fn acquire_target(&mut self) -> Option<usize> {
+        let (index, target) = self
+            .targets
+            .iter_mut()
+            .enumerate()
+            .find(|(_, target)| !target.leased)?;
+        target.leased = true;
+        Some(index)
     }
 
-    /// Returns the exported target while retaining the backing GBM object in `self`.
+    /// Returns disjoint mutable renderer and framebuffer handles for one leased render pass.
+    pub fn render_parts(&mut self, index: usize) -> Option<(&mut GlesRenderer, &mut Dmabuf)> {
+        let target = self.targets.get_mut(index)?;
+        target
+            .leased
+            .then_some((&mut self.renderer, &mut target.dmabuf))
+    }
+
+    /// Returns one exported leased target while retaining the backing GBM object in `self`.
     #[must_use]
-    pub fn dmabuf(&self) -> &Dmabuf {
-        &self.target_dmabuf
+    pub fn dmabuf(&self, index: usize) -> Option<&Dmabuf> {
+        self.targets
+            .get(index)
+            .filter(|target| target.leased)
+            .map(|target| &target.dmabuf)
+    }
+
+    /// Releases one target after all cross-thread frame owners have dropped it.
+    pub fn release_target(&mut self, index: usize) -> bool {
+        let Some(target) = self.targets.get_mut(index) else {
+            return false;
+        };
+        let was_leased = target.leased;
+        target.leased = false;
+        was_leased
+    }
+
+    #[must_use]
+    pub fn pool_size(&self) -> usize {
+        self.targets.len()
     }
 
     #[must_use]
@@ -111,20 +152,32 @@ impl GlesGbmTarget {
         (self.width, self.height)
     }
 
-    /// Allocates a replacement before releasing the current target.
+    /// Allocates a complete replacement pool before releasing the current targets.
     pub fn resize(&mut self, width: u32, height: u32) -> Result<(), RendererError> {
         validate_dimensions(width, height)?;
         if (width, height) == (self.width, self.height) {
             return Ok(());
         }
-        let (target_bo, target_dmabuf) =
-            allocate_target(&self.allocator, &self.render_node, width, height)?;
-        self.target_bo = target_bo;
-        self.target_dmabuf = target_dmabuf;
+        if self.targets.iter().any(|target| target.leased) {
+            return Err(RendererError::Busy);
+        }
+        let targets = allocate_targets(&self.allocator, &self.render_node, width, height)?;
+        self.targets = targets;
         self.width = width;
         self.height = height;
         Ok(())
     }
+}
+
+fn allocate_targets(
+    allocator: &RawGbmDevice<File>,
+    render_node: &DrmNode,
+    width: u32,
+    height: u32,
+) -> Result<Vec<RenderTarget>, RendererError> {
+    (0..TARGET_POOL_SIZE)
+        .map(|_| allocate_target(allocator, render_node, width, height))
+        .collect()
 }
 
 fn allocate_target(
@@ -132,8 +185,8 @@ fn allocate_target(
     render_node: &DrmNode,
     width: u32,
     height: u32,
-) -> Result<(BufferObject<()>, Dmabuf), RendererError> {
-    let bo = allocator
+) -> Result<RenderTarget, RendererError> {
+    let buffer_object = allocator
         .create_buffer_object(
             width,
             height,
@@ -141,20 +194,24 @@ fn allocate_target(
             BufferObjectFlags::RENDERING,
         )
         .map_err(|_| RendererError::Allocate)?;
-    let fd = bo.fd().map_err(|_| RendererError::Allocate)?;
-    let modifier = Modifier::from(Into::<u64>::into(bo.modifier()));
+    let fd = buffer_object.fd().map_err(|_| RendererError::Allocate)?;
+    let modifier = Modifier::from(Into::<u64>::into(buffer_object.modifier()));
     let mut builder = Dmabuf::builder(
         (width as i32, height as i32),
         Fourcc::Argb8888,
         modifier,
         DmabufFlags::empty(),
     );
-    if !builder.add_plane(fd, 0, 0, bo.stride()) {
+    if !builder.add_plane(fd, 0, 0, buffer_object.stride()) {
         return Err(RendererError::Allocate);
     }
     builder.set_node(*render_node);
     let dmabuf = builder.build().ok_or(RendererError::Allocate)?;
-    Ok((bo, dmabuf))
+    Ok(RenderTarget {
+        _buffer_object: buffer_object,
+        dmabuf,
+        leased: false,
+    })
 }
 
 fn validate_dimensions(width: u32, height: u32) -> Result<(), RendererError> {
