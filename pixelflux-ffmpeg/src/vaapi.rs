@@ -17,6 +17,8 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::path::PathBuf;
 use std::ptr;
 use std::slice;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use ffmpeg_sys_next as ff;
 
@@ -60,6 +62,17 @@ struct AVDRMFrameDescriptor {
 
 struct DmabufResources {
     fds: Vec<c_int>,
+    released: Arc<AtomicBool>,
+}
+
+unsafe fn discard_unwrapped_drm_frame(
+    descriptor: *mut AVDRMFrameDescriptor,
+    resources: &mut DmabufResources,
+) {
+    for fd in resources.fds.drain(..) {
+        libc::close(fd);
+    }
+    ff::av_free(descriptor.cast::<c_void>());
 }
 
 unsafe extern "C" fn release_drm_frame(opaque: *mut c_void, data: *mut u8) {
@@ -71,6 +84,7 @@ unsafe extern "C" fn release_drm_frame(opaque: *mut c_void, data: *mut u8) {
         if !data.is_null() {
             ff::av_free(data.cast::<c_void>());
         }
+        resources.released.store(true, Ordering::Release);
     }));
 }
 
@@ -247,6 +261,7 @@ pub struct EncodedPacket {
     pub annex_b: Vec<u8>,
     pub keyframe: bool,
     pub pts: i64,
+    pub input_released: bool,
 }
 
 /// Stable failure classes exposed to embedding adapters.
@@ -850,16 +865,20 @@ impl VaapiHostEncoder {
                 ));
             }
 
+            let release_observed = Arc::new(AtomicBool::new(false));
             let mut resources = DmabufResources {
                 fds: Vec::with_capacity(frame.planes.len()),
+                released: Arc::clone(&release_observed),
             };
-            (*descriptor).nb_objects = c_int::try_from(frame.planes.len()).map_err(|_| {
-                VaapiError::new(
+            let Ok(nb_objects) = c_int::try_from(frame.planes.len()) else {
+                discard_unwrapped_drm_frame(descriptor, &mut resources);
+                return Err(VaapiError::new(
                     VaapiErrorKind::InvalidConfiguration,
                     "validate DRM-PRIME frame",
                     "plane count does not fit FFmpeg",
-                )
-            })?;
+                ));
+            };
+            (*descriptor).nb_objects = nb_objects;
             (*descriptor).nb_layers = 1;
             (*descriptor).layers[0].format = frame.fourcc;
             (*descriptor).layers[0].nb_planes = (*descriptor).nb_objects;
@@ -874,10 +893,7 @@ impl VaapiHostEncoder {
             for (index, plane) in frame.planes.iter().enumerate() {
                 let fd = libc::dup(plane.fd.as_raw_fd());
                 if fd < 0 {
-                    for duplicated in resources.fds.drain(..) {
-                        libc::close(duplicated);
-                    }
-                    ff::av_free(descriptor.cast::<c_void>());
+                    discard_unwrapped_drm_frame(descriptor, &mut resources);
                     return Err(VaapiError::new(
                         VaapiErrorKind::EncodeFailed,
                         "duplicate DRM-PRIME file descriptor",
@@ -885,48 +901,49 @@ impl VaapiHostEncoder {
                     ));
                 }
                 resources.fds.push(fd);
-                let object_size = usize::try_from(plane.offset)
-                    .ok()
-                    .and_then(|offset| {
-                        usize::try_from(plane.stride)
-                            .ok()
-                            .and_then(|stride| stride.checked_mul(aligned_height))
-                            .and_then(|bytes| offset.checked_add(bytes))
-                    })
-                    .ok_or_else(|| {
-                        VaapiError::new(
-                            VaapiErrorKind::InvalidConfiguration,
-                            "validate DRM-PRIME frame",
-                            "plane object size overflowed",
-                        )
-                    })?;
+                let Some(object_size) = usize::try_from(plane.offset).ok().and_then(|offset| {
+                    usize::try_from(plane.stride)
+                        .ok()
+                        .and_then(|stride| stride.checked_mul(aligned_height))
+                        .and_then(|bytes| offset.checked_add(bytes))
+                }) else {
+                    discard_unwrapped_drm_frame(descriptor, &mut resources);
+                    return Err(VaapiError::new(
+                        VaapiErrorKind::InvalidConfiguration,
+                        "validate DRM-PRIME frame",
+                        "plane object size overflowed",
+                    ));
+                };
                 (*descriptor).objects[index].fd = fd;
                 (*descriptor).objects[index].size = object_size;
                 (*descriptor).objects[index].format_modifier = frame.modifier;
-                (*descriptor).layers[0].planes[index].object_index = c_int::try_from(index)
-                    .map_err(|_| {
-                        VaapiError::new(
-                            VaapiErrorKind::InvalidConfiguration,
-                            "validate DRM-PRIME frame",
-                            "plane index does not fit FFmpeg",
-                        )
-                    })?;
-                (*descriptor).layers[0].planes[index].offset = isize::try_from(plane.offset)
-                    .map_err(|_| {
-                        VaapiError::new(
-                            VaapiErrorKind::InvalidConfiguration,
-                            "validate DRM-PRIME frame",
-                            "plane offset does not fit FFmpeg",
-                        )
-                    })?;
-                (*descriptor).layers[0].planes[index].pitch = isize::try_from(plane.stride)
-                    .map_err(|_| {
-                        VaapiError::new(
-                            VaapiErrorKind::InvalidConfiguration,
-                            "validate DRM-PRIME frame",
-                            "plane stride does not fit FFmpeg",
-                        )
-                    })?;
+                let Ok(object_index) = c_int::try_from(index) else {
+                    discard_unwrapped_drm_frame(descriptor, &mut resources);
+                    return Err(VaapiError::new(
+                        VaapiErrorKind::InvalidConfiguration,
+                        "validate DRM-PRIME frame",
+                        "plane index does not fit FFmpeg",
+                    ));
+                };
+                let Ok(offset) = isize::try_from(plane.offset) else {
+                    discard_unwrapped_drm_frame(descriptor, &mut resources);
+                    return Err(VaapiError::new(
+                        VaapiErrorKind::InvalidConfiguration,
+                        "validate DRM-PRIME frame",
+                        "plane offset does not fit FFmpeg",
+                    ));
+                };
+                let Ok(pitch) = isize::try_from(plane.stride) else {
+                    discard_unwrapped_drm_frame(descriptor, &mut resources);
+                    return Err(VaapiError::new(
+                        VaapiErrorKind::InvalidConfiguration,
+                        "validate DRM-PRIME frame",
+                        "plane stride does not fit FFmpeg",
+                    ));
+                };
+                (*descriptor).layers[0].planes[index].object_index = object_index;
+                (*descriptor).layers[0].planes[index].offset = offset;
+                (*descriptor).layers[0].planes[index].pitch = pitch;
             }
 
             ff::av_frame_unref(self.video_frame);
@@ -954,6 +971,14 @@ impl VaapiHostEncoder {
             (*self.video_frame).buf[0] = buffer;
             (*self.video_frame).pts = pts;
             (*self.video_frame).hw_frames_ctx = ff::av_buffer_ref(self.drm_frames_ctx);
+            if (*self.video_frame).hw_frames_ctx.is_null() {
+                ff::av_frame_unref(self.video_frame);
+                return Err(VaapiError::new(
+                    VaapiErrorKind::EncodeFailed,
+                    "wrap DRM-PRIME frame",
+                    "FFmpeg could not retain the DRM frames context",
+                ));
+            }
 
             let status = ff::av_buffersrc_add_frame(self.buffersrc_ctx, self.video_frame);
             if status < 0 {
@@ -964,7 +989,29 @@ impl VaapiHostEncoder {
                     status,
                 ));
             }
-            self.receive_and_encode(pts, force_keyframe)
+            let encoded = self.receive_and_encode(pts, force_keyframe);
+            ff::av_frame_unref(self.video_frame);
+            if !release_observed.load(Ordering::Acquire) {
+                ff::avfilter_graph_free(&mut self.filter_graph);
+                self.buffersrc_ctx = ptr::null_mut();
+                self.buffersink_ctx = ptr::null_mut();
+                if !release_observed.load(Ordering::Acquire) {
+                    return Err(VaapiError::new(
+                        VaapiErrorKind::EncodeFailed,
+                        "release DRM-PRIME frame",
+                        "FFmpeg did not release the imported frame when its graph was destroyed",
+                    ));
+                }
+                return Err(VaapiError::new(
+                    VaapiErrorKind::EncodeFailed,
+                    "release DRM-PRIME frame",
+                    "FFmpeg retained the imported frame beyond one converted output",
+                ));
+            }
+            encoded.map(|mut packet| {
+                packet.input_released = true;
+                packet
+            })
         }
     }
 
@@ -1036,6 +1083,7 @@ impl VaapiHostEncoder {
             annex_b: slice::from_raw_parts((*self.packet).data, size).to_vec(),
             keyframe: ((*self.packet).flags & ff::AV_PKT_FLAG_KEY) != 0,
             pts: (*self.packet).pts,
+            input_released: self.input_mode == InputMode::Host,
         };
         if packet.keyframe {
             self.frames_since_keyframe = 0;
